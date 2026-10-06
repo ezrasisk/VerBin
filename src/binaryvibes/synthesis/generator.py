@@ -59,6 +59,7 @@ class BinaryBuilder:
     _code: bytes = b""
     _data: bytes = b""
     _base_addr: int = DEFAULT_BASE_ADDR
+    _pe_symbols: list[str] | None = None  # dynamic IAT symbol list for PE
 
     def set_arch(self, arch: Arch) -> BinaryBuilder:
         """Set target architecture."""
@@ -73,6 +74,16 @@ class BinaryBuilder:
     def set_base_address(self, addr: int) -> BinaryBuilder:
         """Set base virtual address."""
         self._base_addr = addr
+        return self
+
+    def set_pe_symbols(self, symbols: list[str] | None) -> BinaryBuilder:
+        """Set the list of Windows API symbols for a dynamic PE IAT.
+
+        When *symbols* is provided the PE builder emits a minimal Import
+        Address Table containing only those APIs.  When None the classic
+        full import set is used (backward compatible).
+        """
+        self._pe_symbols = symbols
         return self
 
     def add_code(self, code: bytes) -> BinaryBuilder:
@@ -93,7 +104,11 @@ class BinaryBuilder:
             from binaryvibes.synthesis.pe import build_pe64
 
             if self._arch in (Arch.X86_64,):
-                raw = build_pe64(self._code, self._data)
+                raw = build_pe64(
+                    self._code,
+                    self._data,
+                    symbols=self._pe_symbols,
+                )
             else:
                 msg = f"PE generation not supported for {self._arch.value}"
                 raise NotImplementedError(msg)
