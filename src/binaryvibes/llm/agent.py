@@ -193,10 +193,30 @@ class BuildAgent:
 
             # Append PE runtime helpers if targeting Windows PE
             assembly = plan.assembly
+            pe_symbols: list[str] | None = None
             if self.fmt == BinaryFormat.PE:
                 from binaryvibes.llm.pe_runtime import PE_RUNTIME_ASM
+                from binaryvibes.synthesis.pe import (
+                    compute_iat_exports,
+                    extract_pe_symbols,
+                    resolve_imports,
+                    rewrite_iat_addresses,
+                )
 
                 assembly = assembly + "\n" + PE_RUNTIME_ASM
+
+                # Dynamic IAT: discover which APIs the code (LLM + helpers)
+                # actually references, build a minimal import set, and rewrite
+                # any classic absolute IAT addresses to the new layout.
+                pe_symbols = extract_pe_symbols(assembly)
+                if pe_symbols:
+                    new_exports = compute_iat_exports(resolve_imports(pe_symbols))
+                    assembly = rewrite_iat_addresses(assembly, new_exports)
+                    logger.info(
+                        "Dynamic IAT: %d symbols → %s",
+                        len(pe_symbols),
+                        ", ".join(pe_symbols),
+                    )
 
             # Strip ; comments (LLMs often add them, Keystone rejects them)
             cleaned_lines = []
@@ -222,9 +242,15 @@ class BuildAgent:
                 retries_used += 1
                 continue
 
-            # Build the binary
+            # Build the binary (pass dynamic PE symbols when available)
             builder = BinaryBuilder()
-            binary = builder.set_arch(plan.arch).set_format(self.fmt).add_code(code).build()
+            binary = (
+                builder.set_arch(plan.arch)
+                .set_format(self.fmt)
+                .set_pe_symbols(pe_symbols)
+                .add_code(code)
+                .build()
+            )
 
             # Optionally verify via emulation
             emulation_result = None
