@@ -343,3 +343,112 @@ class TestKeystoneIntegration:
         assert parsed.optional_header.addressof_entrypoint == PE_CODE_RVA
         import_libs = [lib.name.lower() for lib in parsed.imports]
         assert "kernel32.dll" in import_libs
+
+
+# ── Dynamic IAT (Waypoint 1) ────────────────────────────────────────
+
+
+class TestDynamicIAT:
+    """Tests for the dynamic Import Address Table builder."""
+
+    def test_resolve_imports_default(self) -> None:
+        from binaryvibes.synthesis.pe import resolve_imports
+        resolved = resolve_imports()
+        assert list(resolved.keys()) == list(_PE_IMPORTS.keys())
+        for dll, funcs in _PE_IMPORTS.items():
+            assert resolved[dll] == list(funcs)
+
+    def test_resolve_imports_minimal(self) -> None:
+        from binaryvibes.synthesis.pe import resolve_imports
+        resolved = resolve_imports(["ExitProcess", "MessageBoxA"])
+        assert list(resolved.keys()) == ["kernel32.dll", "user32.dll"]
+        assert resolved["kernel32.dll"] == ["ExitProcess"]
+        assert resolved["user32.dll"] == ["MessageBoxA"]
+
+    def test_resolve_imports_unknown_raises(self) -> None:
+        from binaryvibes.synthesis.pe import resolve_imports
+        import pytest
+        with pytest.raises(ValueError, match="Unknown API symbol"):
+            resolve_imports(["ThisFunctionDoesNotExist"])
+
+    def test_compute_iat_exports_minimal(self) -> None:
+        from binaryvibes.synthesis.pe import compute_iat_exports, resolve_imports
+        imports = resolve_imports(["ExitProcess", "MessageBoxA"])
+        exports = compute_iat_exports(imports)
+        assert exports["ExitProcess"] == PE_IMAGE_BASE + PE_IDATA_RVA
+        # MessageBoxA is after ExitProcess + null terminator
+        assert exports["MessageBoxA"] == PE_IMAGE_BASE + PE_IDATA_RVA + 16
+
+    def test_build_pe64_with_symbols(self) -> None:
+        pe = build_pe64(EXIT42_CODE, symbols=["ExitProcess"])
+        assert pe[:2] == b"MZ"
+        # Minimal PE should be smaller than the full default
+        pe_full = build_pe64(EXIT42_CODE)
+        assert len(pe) < len(pe_full)
+
+    def test_build_pe64_with_extra_api(self) -> None:
+        """APIs that were never in the original 35 must work."""
+        pe = build_pe64(
+            b"\xc3",
+            symbols=["ExitProcess", "RegOpenKeyExA", "GetUserNameA"],
+        )
+        assert pe[:2] == b"MZ"
+        # Both DLLs should appear in the binary
+        assert b"advapi32.dll\x00" in pe
+        assert b"RegOpenKeyExA\x00" in pe
+        assert b"GetUserNameA\x00" in pe
+
+    def test_build_pe64_with_explicit_imports(self) -> None:
+        from collections import OrderedDict
+        custom = OrderedDict([
+            ("kernel32.dll", ["ExitProcess", "Sleep"]),
+        ])
+        pe = build_pe64(b"\xc3", imports=custom)
+        assert pe[:2] == b"MZ"
+        assert b"ExitProcess\x00" in pe
+        assert b"Sleep\x00" in pe
+        # Should not contain APIs we did not request
+        assert b"MessageBoxA\x00" not in pe
+
+    def test_default_build_unchanged(self) -> None:
+        """Calling build_pe64() with no extra args must keep classic layout."""
+        pe = build_pe64(EXIT42_CODE)
+        assert PE_IAT_EXPORTS["ExitProcess"] == 0x402000
+        assert PE_IAT_EXPORTS["WriteFile"] == 0x402010
+        assert b"kernel32.dll\x00" in pe
+        assert b"user32.dll\x00" in pe
+        assert b"wininet.dll\x00" in pe
+        assert b"shell32.dll\x00" in pe
+
+
+class TestExtractAndRewrite:
+    """Tests for symbol extraction and IAT address rewriting."""
+
+    def test_extract_from_absolute_addresses(self) -> None:
+        from binaryvibes.synthesis.pe import extract_pe_symbols
+        asm = "mov eax, 0x402000\nmov eax, 0x402010\n"
+        syms = extract_pe_symbols(asm)
+        assert "ExitProcess" in syms
+        assert "WriteFile" in syms
+
+    def test_extract_always_includes_exitprocess(self) -> None:
+        from binaryvibes.synthesis.pe import extract_pe_symbols
+        syms = extract_pe_symbols("nop")
+        assert syms == ["ExitProcess"]
+
+    def test_rewrite_moves_addresses(self) -> None:
+        from binaryvibes.synthesis.pe import (
+            extract_pe_symbols,
+            resolve_imports,
+            compute_iat_exports,
+            rewrite_iat_addresses,
+            PE_IAT_EXPORTS,
+        )
+        asm = "mov eax, 0x4020F0\n"  # classic MessageBoxA
+        syms = extract_pe_symbols(asm + "\nmov eax, 0x402000\n")
+        exports = compute_iat_exports(resolve_imports(syms))
+        rewritten = rewrite_iat_addresses(asm, exports)
+        # MessageBoxA should no longer be at the classic address
+        if exports["MessageBoxA"] != PE_IAT_EXPORTS["MessageBoxA"]:
+            assert "0x4020F0" not in rewritten.upper().replace("0X", "0x")
+            assert f"{exports['MessageBoxA']:X}" in rewritten.upper()
